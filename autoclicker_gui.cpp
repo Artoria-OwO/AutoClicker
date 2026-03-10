@@ -2,6 +2,7 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
+#include <shellapi.h>
 #include <commctrl.h>
 #include <dwmapi.h>
 #include <thread>
@@ -13,6 +14,8 @@
 
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "dwmapi.lib")
+#pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "advapi32.lib")
 
 #define C_BG        RGB(0x1E, 0x1E, 0x2E)
 #define C_CARD      RGB(0x28, 0x28, 0x3E)
@@ -121,6 +124,21 @@ std::atomic<bool> g_user_holding_trigger{false};
 std::atomic<int>  g_simulated_up_count{0};
 bool              g_key_was_pressed = false;
 std::atomic<int>  g_hold_release_count{0};
+std::atomic<int>  g_press_duration_ms{17};
+
+int DetectFrameDurationMs() {
+    HWND fg = GetForegroundWindow();
+    HMONITOR hMon = MonitorFromWindow(fg, MONITOR_DEFAULTTOPRIMARY);
+    MONITORINFOEXW mi = {};
+    mi.cbSize = sizeof(mi);
+    if (GetMonitorInfoW(hMon, &mi)) {
+        DEVMODEW dm = {};
+        dm.dmSize = sizeof(dm);
+        if (EnumDisplaySettingsW(mi.szDevice, ENUM_CURRENT_SETTINGS, &dm) && dm.dmDisplayFrequency > 0)
+            return (int)(1000.0 / dm.dmDisplayFrequency) + 1;
+    }
+    return 17;
+}
 
 HWND g_hwnd           = nullptr;
 HWND g_hwndStatus     = nullptr;
@@ -173,39 +191,37 @@ void performSimulatedInput() {
     int vk = g_click_key_vk.load();
     if (vk == 0) return;
 
+    int holdMs = g_press_duration_ms.load();
     g_simulating_input = true;
     if (IsMouseButton(vk)) {
         if (vk == g_trigger_key_vk.load()) g_simulated_up_count++;
         INPUT input = {0};
         input.type = INPUT_MOUSE;
+        DWORD downFlag = 0, upFlag = 0;
         switch (vk) {
-            case VK_LBUTTON:
-                input.mi.dwFlags = MOUSEEVENTF_LEFTDOWN;  SendInput(1, &input, sizeof(INPUT));
-                input.mi.dwFlags = MOUSEEVENTF_LEFTUP;    break;
-            case VK_RBUTTON:
-                input.mi.dwFlags = MOUSEEVENTF_RIGHTDOWN; SendInput(1, &input, sizeof(INPUT));
-                input.mi.dwFlags = MOUSEEVENTF_RIGHTUP;   break;
-            case VK_MBUTTON:
-                input.mi.dwFlags = MOUSEEVENTF_MIDDLEDOWN; SendInput(1, &input, sizeof(INPUT));
-                input.mi.dwFlags = MOUSEEVENTF_MIDDLEUP;   break;
-            case VK_XBUTTON1:
-                input.mi.dwFlags = MOUSEEVENTF_XDOWN; input.mi.mouseData = XBUTTON1;
-                SendInput(1, &input, sizeof(INPUT));
-                input.mi.dwFlags = MOUSEEVENTF_XUP;   input.mi.mouseData = XBUTTON1; break;
-            case VK_XBUTTON2:
-                input.mi.dwFlags = MOUSEEVENTF_XDOWN; input.mi.mouseData = XBUTTON2;
-                SendInput(1, &input, sizeof(INPUT));
-                input.mi.dwFlags = MOUSEEVENTF_XUP;   input.mi.mouseData = XBUTTON2; break;
+            case VK_LBUTTON:  downFlag = MOUSEEVENTF_LEFTDOWN;   upFlag = MOUSEEVENTF_LEFTUP;   break;
+            case VK_RBUTTON:  downFlag = MOUSEEVENTF_RIGHTDOWN;  upFlag = MOUSEEVENTF_RIGHTUP;  break;
+            case VK_MBUTTON:  downFlag = MOUSEEVENTF_MIDDLEDOWN; upFlag = MOUSEEVENTF_MIDDLEUP; break;
+            case VK_XBUTTON1: downFlag = MOUSEEVENTF_XDOWN; upFlag = MOUSEEVENTF_XUP; input.mi.mouseData = XBUTTON1; break;
+            case VK_XBUTTON2: downFlag = MOUSEEVENTF_XDOWN; upFlag = MOUSEEVENTF_XUP; input.mi.mouseData = XBUTTON2; break;
             default: g_simulating_input = false; return;
         }
+        input.mi.dwFlags = downFlag;
+        SendInput(1, &input, sizeof(INPUT));
+        std::this_thread::sleep_for(std::chrono::milliseconds(holdMs));
+        input.mi.dwFlags = upFlag;
         SendInput(1, &input, sizeof(INPUT));
     } else {
         g_simulating_input = false;
-        INPUT inputs[2] = {0};
-        inputs[0].type = inputs[1].type = INPUT_KEYBOARD;
-        inputs[0].ki.wVk = inputs[1].ki.wVk = (WORD)vk;
-        inputs[1].ki.dwFlags = KEYEVENTF_KEYUP;
-        SendInput(2, inputs, sizeof(INPUT));
+        WORD scan = (WORD)MapVirtualKeyW((UINT)vk, MAPVK_VK_TO_VSC);
+        INPUT down = {0}, up = {0};
+        down.type = up.type = INPUT_KEYBOARD;
+        down.ki.wVk = up.ki.wVk = (WORD)vk;
+        down.ki.wScan = up.ki.wScan = scan;
+        up.ki.dwFlags = KEYEVENTF_KEYUP;
+        SendInput(1, &down, sizeof(INPUT));
+        std::this_thread::sleep_for(std::chrono::milliseconds(holdMs));
+        SendInput(1, &up, sizeof(INPUT));
     }
     g_simulating_input = false;
 }
@@ -221,8 +237,11 @@ int getRandomInterval() {
 void clickWorker() {
     while (g_running) {
         if (g_clicking) {
+            g_press_duration_ms = DetectFrameDurationMs();
             performSimulatedInput();
-            std::this_thread::sleep_for(std::chrono::milliseconds(getRandomInterval()));
+            int remaining = getRandomInterval() - g_press_duration_ms.load();
+            if (remaining > 0)
+                std::this_thread::sleep_for(std::chrono::milliseconds(remaining));
         } else {
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
@@ -649,7 +668,43 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     return DefWindowProcW(hwnd, msg, wParam, lParam);
 }
 
+static bool IsRunAsAdmin() {
+    BOOL isAdmin = FALSE;
+    PSID adminGroup = nullptr;
+    SID_IDENTIFIER_AUTHORITY ntAuth = SECURITY_NT_AUTHORITY;
+    if (AllocateAndInitializeSid(&ntAuth, 2, SECURITY_BUILTIN_DOMAIN_RID,
+            DOMAIN_ALIAS_RID_ADMINS, 0, 0, 0, 0, 0, 0, &adminGroup)) {
+        CheckTokenMembership(nullptr, adminGroup, &isAdmin);
+        FreeSid(adminGroup);
+    }
+    return isAdmin != FALSE;
+}
+
+static bool TryElevate() {
+    wchar_t path[MAX_PATH];
+    GetModuleFileNameW(nullptr, path, MAX_PATH);
+    SHELLEXECUTEINFOW sei = {sizeof(sei)};
+    sei.lpVerb = L"runas";
+    sei.lpFile = path;
+    sei.nShow = SW_SHOWNORMAL;
+    sei.fMask = SEE_MASK_NOCLOSEPROCESS;
+    if (ShellExecuteExW(&sei)) {
+        if (sei.hProcess) CloseHandle(sei.hProcess);
+        return true;
+    }
+    return false;
+}
+
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
+    if (!IsRunAsAdmin()) {
+        if (TryElevate()) ExitProcess(0);
+        MessageBoxW(nullptr,
+            L"\x672A\x80FD\x83B7\x53D6\x7BA1\x7406\x5458\x6743\x9650\xFF0C"
+            L"\x90E8\x5206\x529F\x80FD\x53EF\x80FD\x65E0\x6CD5\x6B63\x5E38\x4F7F\x7528\x3002",
+            L"Auto Clicker", MB_ICONWARNING | MB_OK);
+    }
+    g_press_duration_ms = DetectFrameDurationMs();
+
     std::thread clickThread(clickWorker);
     std::thread hotkeyThread(hotkeyMonitor);
     clickThread.detach();
